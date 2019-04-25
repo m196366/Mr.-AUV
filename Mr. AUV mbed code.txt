@@ -1,0 +1,276 @@
+//Final mbed code with depth sensor code included
+// #include library, #define variables
+#include "mbed.h"
+#include "BNO055.h" //StressedDave/BNO055
+#include "MS5837.h" //Andrew Olguin/MS5837
+#define PI 3.1415926535
+
+// initialize
+Serial pc(USBTX, USBRX); //serial connection to pi
+BNO055 imu(p28, p27); //IMU
+MS5837 Dsensor(p9, p10);  // sda, scl this is the pressure sensor
+PwmOut T1(p23); // Thruster 1 (left)
+PwmOut T2(p25); // Thruster 2 (right)
+PwmOut T3(p21); // Thruster 3 (vertical)
+DigitalOut led1(LED1); //use to ensure connection or thruster initialization
+Timer t;
+
+// calibration variables
+char calib_local[] = {0xFC,0xFF,
+                      0x05,0x00,
+                      0x20,0x00,
+                      0x12,0x00,
+                      0xB0,0xFF,
+                      0x24,0x01,
+                      0xFE,0xFF,
+                      0x01,0x00,
+                      0x01,0x00,
+                      0xE8,0x03,
+                      0x67,0x03
+                     };
+
+
+
+
+//init vars
+float r2d = 180.0/PI; //radian to decimal
+float d2r = PI/180.0; //decimal to radians
+float PiVal1 = 0.0; // received value from PI
+float PiVal2 = 0.0; // received value from PI
+float PiVal3 = 0.0; // received value from PI
+float cmds[5] = {0,0,0,0,0}; // received commands from RaspPi (heading, depth)
+float Hmeas = 0.0; // measured heading
+float Hdes = 0.0; // desired heading
+float Herr = 0.0; // heading error
+float Ddes = 0.0; // desired depth
+float Derr = 0.0; // depth error
+float Dmeas = 0.0; // measured depth
+float Hcorr1 = 0.0; // heading correction for T1
+float Hcorr2 = 0.0; // heading correction for T2
+float Dcorr = 0.0; // depth correction for T3
+float Kph = 300.0/180.0; // heading proportional constant
+float max_depth = 16.0; // change this to 50 when in the severn?
+float Kpd = 400.0/max_depth; // depth proportional constant
+float cmd = 0.0; // command signal for fwd/rev/turns/ascend/descend
+float dt = 0.1; // wait time
+int check = 0; // send this to serial
+int ser = 0; // receive a 123 when connected
+int neut = 1500; // neutral 1500
+int loP = 100; // low power
+int hiP = 250; // high power
+int m1dir = 0; //motor 1 direction
+int m2dir = 0; //motor 2 direction
+int m3dir = 0; //motor 3 direction
+
+// THIS IS WHAT YOU CHANGE WHEN IN/OUT THE WATER
+int P = loP; // when out of water
+//int P = hiP; // when in water
+//int P = 400; // max power
+
+
+// small functions
+void setupT()
+{
+    T1.pulsewidth_us(neut); // 1500 micro seconds neutral input for initialization
+    T2.pulsewidth_us(neut);
+    T3.pulsewidth_us(neut);
+    wait(0.2);
+} // end Setup Thrusters
+
+void setupIMU()
+{
+    imu.reset();
+    wait(0.2);
+    // Set power mode, POWER_MODE_NORMAL(default), POWER_MODE_LOWPOWER, or POWER_MODE_SUSPEND(sleep)
+    // By default, I2C will pull high when bus is free(pg90 of datasheet)
+    imu.setpowermode(POWER_MODE_NORMAL);
+    imu.setmode(OPERATION_MODE_CONFIG);
+    imu.SetExternalCrystal(1);
+    //bno.set_orientation(1); // I don't know what this does, but I don't need it for now.
+    imu.setmode(OPERATION_MODE_NDOF);  //Uses magnetometer
+    //imu.setmode(OPERATION_MODE_NDOF_FMC_OFF);   //no magnetometer, don't need this one either
+    imu.set_angle_units(DEGREES);
+} // end Setup IMU
+
+//depth sensor was working by itself but not once it got connected to board
+void setupDsensor()
+{
+    Dsensor.MS5837Init();
+}
+
+void checkSer() //check for 123 from pi
+{
+    pc.scanf("%d",&ser); // read signal from Matlab / RaspPi
+    if (ser==123) {
+        check = 123;
+    }
+    pc.printf("%d\n", check); // visual check on Matlab
+} // end Check Serial Connection
+
+void ReadSignals() //This is where we were getting stuck, we believe the mbed is looking for a different format than float, but we do not know what.
+{
+    pc.scanf("HeadingFromPC%f",&PiVal1); // read signal from RaspPi
+    Hdes = PiVal1;
+    pc.scanf("DepthFromPC%f",&PiVal2); // read signal from RaspPi
+    Ddes = PiVal2;
+    pc.scanf("CommandFromPC%f",&PiVal3); // read signal from RaspPi
+    cmd = PiVal3;
+    //pc.scanf("%f",&PiVal1); // read signal from RaspPi
+    //Hdes = PiVal1;
+    //pc.scanf("%f",&PiVal2); // read signal from RaspPi
+    //Ddes = PiVal2;
+    //pc.scanf("%f",&PiVal3); // read signal from RaspPi
+    //cmd = PiVal3;
+    //pc.printf("%.1f\n",cmd); // visual check on Matlab
+} // end Read Signals
+
+void DirCtrl()
+{
+    if (cmd==1.0) { // fwd
+        m1dir = +1;
+        m2dir = +1;
+    } else if (cmd==-1.0) { // rev
+        m1dir = -1;
+        m2dir = -1;
+    } else if (cmd==3.0) { // right turn
+        m1dir = +1;
+        m2dir = -1;
+    } else if (cmd==-3.0) { // left turn
+        m1dir = -1;
+        m2dir = +1;
+    } else if (cmd==5.0) { // asscend
+        m3dir = +1;
+    } else if (cmd==-5.0) { // descend
+        m3dir = -1;
+    } else {
+        m1dir = 0;
+        m2dir = 0;
+        m3dir = 0;
+    }
+} // end Direction Control
+
+void HerrCalc()
+{
+    imu.get_angles();
+    imu.get_calib();
+    
+    // This gets the calibration values of the IMU
+    int sys_stat = (imu.calib >> 6) & 0x03;
+    //int gyr_stat = (imu.calib >> 4) & 0x03;
+    //int acc_stat = (imu.calib >> 2) & 0x03;
+    //int mag_stat = imu.calib & 0x03;
+
+    if (sys_stat==0) { // checks system calibration before trusting its values
+        Herr = 0.0;
+    } else {
+        Hmeas = imu.euler.yaw;
+        Herr = Hmeas-Hdes; // positive=I am right; negative=I am left
+        // this corrects Herr if 180 deg off
+        // For ex. desired heading 000, measured heading 350,
+        // Herr = Hmeas-Hdes = 350; positive would mean "My heading is right of desired"
+        // This changes Herr = Herr - 360 = -10; negative would mean "My heading is left of desired"
+        // Easier to come 10 degrees right, than 350 degrees left.
+        if (Herr > 180.0) {
+            Herr = Herr - 360.0;
+        }
+        if (Herr <= -180.0) {
+            Herr = Herr + 360.0;
+        }
+    } // end if,else
+
+    // Not using these, but you could extract all calibration values and all euler angles
+    //pc.printf("%10.2f %.2f %.2f %.2f\r\n", t.read(), bno.euler.roll, bno.euler.pitch, bno.euler.yaw);
+    //pc.printf("R=%6.3f P=%6.3f  Y=%6.3f    :  STAT= S%1d G%1d A%1d M%1d\r\n", -bno.euler.roll, bno.euler.pitch, bno.euler.yaw,sys_stat,gyr_stat,acc_stat,mag_stat);
+} // end Heading Error Calculation
+
+void DerrCalc()
+{
+    //Dsensor.Barometer_MS5837();  //read I2C data from sensor and update variables
+    //Dmeas = Dsensor.depth() - 10.401103;
+    Dmeas = 0.0; // DELETE THIS ONCE THE DEPTH SENSOR IS INTEGRATED
+    Derr = Ddes-Dmeas; // positive=I am high; negative=I am low
+} // end Depth Error Calculation
+
+void Hctrl() // This is the control law for the heading error
+{
+    if (Herr > 0.0) {
+        Hcorr2 = Kph*Herr;
+        Hcorr1 = 0.0;
+    } else if (Herr <0.0) {
+        Hcorr1 = -Kph*Herr;
+        Hcorr2 = 0.0;
+    } else {
+        Hcorr1 = 0.0;
+        Hcorr2 = 0.0;
+    }
+} // end Heading Controller
+
+void Dctrl() // this is the control law for the depth error
+{
+    Dcorr = Kpd*Derr;
+} // end Depth Controller
+
+/*
+void Tcorrect()
+{ // This function ensures that the input to the thruster stays between 1100--1900
+    if ((neut+m1dir*P+Hcorr1)>1900) {
+        Hcorr1 = Hcorr1 + (1900 - (neut+m1dir*P+Hcorr1));
+    } elseif ((neut+m1dir*P+Hcorr1)<1100) {
+        Hcorr1 = Hcorr1 + (1100 - (neut+m1dir*P+Hcorr1));
+    }
+    
+    if ((neut+m1dir*P+Hcorr2)>1900) {
+        Hcorr1 = Hcorr2 + (1900 - (neut+m1dir*P+Hcorr2));
+    } elseif ((neut+m1dir*P+Hcorr2)<1100) {
+        Hcorr1 = Hcorr2 + (1100 - (neut+m1dir*P+Hcorr2));
+    }
+    
+    if ((neut+m1dir*P+Dcorr)>1900) {
+        Dcorr = Dcorr + (1900 - (neut+m1dir*P+Dcorr));
+    } elseif ((neut+m1dir*P+Dcorr)<1100) {
+        Dcorr = Dcorr + (1100 - (neut+m1dir*P+Dcorr));
+    }
+    
+} // end Thruster Input Correction
+*/
+
+void ActuateThrust()
+{
+    T1.pulsewidth_us(neut+m1dir*P+Hcorr1); // sends signal to ESC1
+    T2.pulsewidth_us(neut+m2dir*P+Hcorr2); // sends signal to ESC2
+    T3.pulsewidth_us(neut+m3dir*P+Dcorr); // sends signal to ESC3
+} // end Actuate Thrusters
+
+int main()
+{
+    pc.baud(115200);
+    led1 = 0;
+
+    setupT();
+    setupIMU();
+    //setupDsensor();
+    checkSer();
+    led1 = 1;
+
+    while(1) {
+        // Read Signals from MATLAB/RaspPI/etc...
+        ReadSignals();
+        // Determine Direction
+        DirCtrl();
+        // Calculate Herr
+        HerrCalc();
+        // Calculate Derr
+        DerrCalc();
+        // Heading Controller
+        Hctrl();
+        // Depth Controller
+        Dctrl();
+        // Check Thruster Inputs
+        //Tcorrect();
+        // Actuate Thrusters
+        ActuateThrust();
+
+        wait(dt);
+    } // end while
+} // end main
+
