@@ -1,0 +1,47 @@
+//Final mbed code with depth sensor code included
+// #include library, #define variables
+#include "mbed.h"
+#include "BNO055.h" //StressedDave/BNO055
+#include "MS5837.h" //Andrew Olguin/MS5837
+#define PI 3.1415926535
+
+// initialize
+Serial pc(USBTX, USBRX); //serial connection to pi
+BNO055 imu(p28, p27); //IMU
+MS5837 Dsensor(p9, p10);  // sda, scl this is the pressure sensor
+PwmOut T1(p23); // Thruster 1 (left)
+PwmOut T2(p25); // Thruster 2 (right)
+PwmOut T3(p21); // Thruster 3 (vertical)
+DigitalOut led1(LED1); //use to ensure connection or thruster initialization
+Timer t;
+
+// calibration variables
+// This currently is not being used, but the idea was to find the calibration status values for the IMU for a certain area
+// so that those values can be updated directly into the IMU upon startup, so that you don't have to shake the IMU around
+// to get a calibrated status.
+    imu.setmode(OPERATION_MODE_NDOF);  //Uses magnetometer, look at BNO055 IMU datasheet for these options
+    // This was never completed or tested so check the math to ensure it's correct before using it.
+    checkSer(); // once you always have a working serial connection, you don't need to do this everytime.
+    led1 = 1;
+
+    while(1) {
+        // Read Signals from MATLAB/RaspPI/etc...
+        ReadSignals();
+        // Determine Direction
+        DirCtrl();
+        // Calculate Herr
+        HerrCalc();
+        // Calculate Derr
+        DerrCalc();
+        // Heading Controller
+        Hctrl();
+        // Depth Controller
+        Dctrl();
+        // Check Thruster Inputs
+        //Tcorrect();
+        // Actuate Thrusters
+        ActuateThrust();
+
+        wait(dt);
+    } // end while
+} // end main
